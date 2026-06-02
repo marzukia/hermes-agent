@@ -191,8 +191,6 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         )
     else:
         skills_prompt = ""
-    if skills_prompt:
-        stable_parts.append(skills_prompt)
 
     # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
     # of the requested model. Inject explicit model identity into the system prompt
@@ -299,6 +297,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # ── Volatile tier (changes per session/turn — never cached) ───
     volatile_parts: List[str] = []
+    # Skills are runtime-mutable: the agent adds and patches them mid-session
+    # (SKILLS_GUIDANCE tells it to patch a skill the moment it goes stale,
+    # without waiting to be asked), so the skills index is not byte-stable and
+    # must not sit in the stable band, where a single skill edit invalidates
+    # the entire cached prefix before it. Render it at the front of the
+    # volatile band so the stable scaffold stays cacheable across skill edits.
+    if skills_prompt:
+        volatile_parts.append(skills_prompt)
 
     if agent._memory_store:
         if agent._memory_enabled:
