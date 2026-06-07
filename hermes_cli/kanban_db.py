@@ -2223,6 +2223,17 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                     },
                 )
+                # Stage-chain auto-entry: stamp the first stage's key when a
+                # stage_chain is configured AND this task's assignee matches the
+                # first stage's profile, so worker tasks enter the pipeline at
+                # the first stage while review-children, other-profile tasks,
+                # and chain-less boards are untouched. Same txn as the insert.
+                _fs = _first_stage_key_for(conn, assignee)
+                if _fs is not None:
+                    conn.execute(
+                        "UPDATE tasks SET current_step_key=? WHERE id=?",
+                        (_fs, task_id),
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -2309,7 +2320,7 @@ def list_tasks(
             )
         query += f" ORDER BY {VALID_SORT_ORDERS[order_by]}"
     else:
-        query += " ORDER BY priority DESC, created_at ASC"
+        query += " ORDER BY priority ASC, created_at ASC"
     if limit:
         query += f" LIMIT {int(limit)}"
     rows = conn.execute(query, params).fetchall()
@@ -3502,6 +3513,106 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+def _board_dir_from_conn(conn) -> Optional[str]:
+    """Return the directory containing the connection's own ``kanban.db`` (where
+    its ``board.json`` sibling lives). This lets stage resolution read the board
+    config straight from the DB the operation is actually touching, independent
+    of ambient env that a fresh ``hermes kanban`` subprocess (e.g. the dashboard
+    shelling out) may not have. Returns None if the path can't be read."""
+    if conn is None:
+        return None
+    try:
+        for row in conn.execute("PRAGMA database_list"):
+            f = row[2]  # (seq, name, file)
+            if f and os.path.basename(f) == "kanban.db":
+                return os.path.dirname(f)
+    except Exception:
+        return None
+    return None
+
+
+def _resolve_stage_chain(conn=None) -> list:
+    """Return the active board's stage_chain (list) or []. Reads ``board.json``
+    DIRECTLY from the directory the connection's own ``kanban.db`` lives in (its
+    sibling), so it resolves correctly regardless of ambient env — a fresh
+    ``hermes kanban`` subprocess with no HERMES_HOME still gets the right chain.
+    Falls back to ambient board resolution (HERMES_KANBAN_BOARD / current-board
+    pointer) only if the sibling read yields nothing. Never raises."""
+    # 1. Read board.json straight off the connection's own directory. This is
+    #    the env-independent path that the dispatch AND dashboard/CLI contexts
+    #    both hit, because the conn always points at the right board's DB.
+    d = _board_dir_from_conn(conn)
+    if d:
+        try:
+            bj = os.path.join(d, "board.json")
+            if os.path.isfile(bj):
+                with open(bj) as fh:
+                    meta = json.load(fh)
+                chain = meta.get("stage_chain") if isinstance(meta, dict) else None
+                if isinstance(chain, (list, tuple)):
+                    return list(chain)
+        except Exception:
+            pass
+    # 2. Fallback: ambient resolution (covers any conn-less caller).
+    try:
+        board = os.environ.get("HERMES_KANBAN_BOARD")
+        if not board:
+            board = get_current_board()
+        meta = read_board_metadata(board)
+        chain = meta.get("stage_chain") if isinstance(meta, dict) else None
+        return list(chain) if isinstance(chain, (list, tuple)) else []
+    except Exception:
+        return []
+
+
+def _first_stage_key_for(conn, assignee: Optional[str]) -> Optional[str]:
+    """Return the chain's first stage key IF a stage_chain is configured and
+    ``assignee`` matches that first stage's profile; else None. So a worker
+    task auto-enters the pipeline at the first stage, while review-children,
+    other-profile tasks, and chain-less boards are left untouched."""
+    if not assignee:
+        return None
+    chain = _resolve_stage_chain(conn)
+    if not chain:
+        return None
+    first = chain[0]
+    if isinstance(first, dict) and first.get("key") and first.get("profile") == assignee:
+        return first.get("key")
+    return None
+
+
+def _next_stage_for(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict]:
+    """Return the next stage dict for ``task_id`` when a stage_chain is
+    configured and the task's current step has a successor; else None.
+
+    The chain lives in ``board.json`` under ``stage_chain`` as an ordered
+    list of ``{"key": ..., "profile": ...}`` entries. With no stage_chain
+    configured (the default) this always returns None, so :func:`complete_task`
+    behaves exactly as it did before. Opt-in by construction.
+    """
+    chain = _resolve_stage_chain(conn)
+    if not chain:
+        return None
+    row = conn.execute(
+        "SELECT current_step_key FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    cur_key = (row[0] if row else None)
+    if not cur_key:
+        return None
+    keys = [s.get("key") for s in chain if isinstance(s, dict)]
+    if cur_key not in keys:
+        return None
+    i = keys.index(cur_key)
+    if i + 1 >= len(chain):
+        return None
+    nxt = chain[i + 1]
+    if isinstance(nxt, dict) and nxt.get("key") and nxt.get("profile"):
+        return nxt
+    return None
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3568,6 +3679,48 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    # Stage-chain advance (opt-in, default-off). If a stage_chain is configured
+    # in board.json AND this task's current step has a next stage, advance to
+    # it (reassign to that stage's profile, set the next step_key, back to
+    # ready) instead of marking done. With no stage_chain configured this is a
+    # no-op and completion falls through to the normal done path below — zero
+    # behaviour change by default.
+    _next_stage = _next_stage_for(conn, task_id)
+    if _next_stage is not None:
+        with write_txn(conn):
+            if expected_run_id is None:
+                cur = conn.execute(
+                    "UPDATE tasks SET status='ready', current_step_key=?, "
+                    "assignee=?, claim_lock=NULL, claim_expires=NULL, "
+                    "worker_pid=NULL "
+                    "WHERE id=? AND status IN ('running','ready','blocked')",
+                    (_next_stage.get("key"), _next_stage.get("profile"), task_id),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE tasks SET status='ready', current_step_key=?, "
+                    "assignee=?, claim_lock=NULL, claim_expires=NULL, "
+                    "worker_pid=NULL "
+                    "WHERE id=? AND status IN ('running','ready','blocked') "
+                    "AND current_run_id=?",
+                    (_next_stage.get("key"), _next_stage.get("profile"),
+                     task_id, int(expected_run_id)),
+                )
+            if cur.rowcount != 1:
+                return False
+            _end_run(
+                conn, task_id, outcome="stage_advanced", status="advanced",
+                summary=summary if summary is not None else result,
+                metadata=metadata,
+            )
+            _append_event(
+                conn, task_id, "stage_advanced",
+                {"to_step": _next_stage.get("key"),
+                 "to_profile": _next_stage.get("profile")},
+            )
+        recompute_ready(conn)
+        return True
 
     with write_txn(conn):
         if expected_run_id is None:
@@ -3681,6 +3834,79 @@ def complete_task(
     recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
+    return True
+
+
+def request_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Transition ``running|ready -> review`` and end the worker's run.
+
+    This is the on-ramp to the review pipeline. A worker whose output is a
+    code change that needs review before counting as merged/done calls this
+    instead of :func:`complete_task`. The dispatcher's review loop then
+    claims the task (``review -> running``), force-loads the ``sdlc-review``
+    skill, and spawns a review agent on the SAME task, which merges
+    (``-> done``) or rejects (``-> running`` for the worker to fix).
+
+    ``summary``/``metadata`` are the structured handoff (changed_files,
+    tests_run, diff_path, ...) the reviewer reads via the closing run.
+    Unlike :func:`complete_task` this deliberately does NOT clean up the
+    scratch workspace (the reviewer needs the worker's branch) and does
+    NOT recompute dependent readiness (the task is not ``done`` yet). It
+    releases the worker's claim so the review dispatch can re-claim.
+    Returns False if the task was not in a transitionable state.
+    """
+    with write_txn(conn):
+        if expected_run_id is None:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status       = 'review',
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL
+                 WHERE id = ?
+                   AND status IN ('running', 'ready')
+                """,
+                (task_id,),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status       = 'review',
+                       claim_lock   = NULL,
+                       claim_expires= NULL,
+                       worker_pid   = NULL
+                 WHERE id = ?
+                   AND status IN ('running', 'ready')
+                   AND current_run_id = ?
+                """,
+                (task_id, int(expected_run_id)),
+            )
+        if cur.rowcount != 1:
+            return False
+        _end_run(
+            conn, task_id,
+            outcome="submitted_for_review", status="review",
+            summary=summary if summary is not None else None,
+            metadata=metadata,
+        )
+        _append_event(
+            conn, task_id, "review_requested",
+            {
+                "summary_preview": (
+                    summary.strip().splitlines()[0][:200]
+                    if summary else None
+                ),
+            },
+        )
     return True
 
 
@@ -5839,7 +6065,7 @@ def dispatch_once(
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        "ORDER BY priority ASC, created_at ASC"
     ).fetchall()
     # Honour kanban.max_in_progress: if the board already has enough running
     # tasks, skip spawning this tick so slow workers (local LLMs,
@@ -6075,7 +6301,7 @@ def dispatch_once(
     review_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'review' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
+        "ORDER BY priority ASC, created_at ASC"
     ).fetchall()
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
@@ -6115,6 +6341,18 @@ def dispatch_once(
         # means the review agent gets both kanban-worker (lifecycle)
         # and sdlc-review (review logic: AC verification, merge, etc.).
         claimed.skills = ["sdlc-review"]
+        # Run review on the independent `reviewer` seat (model-independence:
+        # don't let the worker's own model grade its own work). This overrides
+        # only the in-memory spawn profile, so _default_spawn launches
+        # `hermes -p reviewer`; the task's stored assignee is untouched, so a
+        # rejection still bounces the task back to the original worker. Guarded:
+        # fall back to the task's assignee if the reviewer profile is missing.
+        try:
+            from hermes_cli.profiles import profile_exists as _review_profile_exists
+            if _review_profile_exists("reviewer"):
+                claimed.assignee = "reviewer"
+        except Exception:
+            pass
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect

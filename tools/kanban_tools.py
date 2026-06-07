@@ -549,6 +549,27 @@ def _handle_complete(args: dict, **kw) -> str:
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
     metadata = _stamp_worker_session_metadata(tid, metadata)
+    # Review handoff. If the output is a code change that needs review
+    # before it counts as merged/done, route to request_review (moves the
+    # task running/ready -> review) instead of marking it done. The
+    # dispatcher's review loop then spawns the sdlc-review agent on this
+    # same task, which merges (-> done) or sends it back for fixes.
+    if bool(args.get("review")):
+        rb, rconn = _connect(board=args.get("board"))
+        try:
+            review_ok = rb.request_review(
+                rconn, tid,
+                summary=summary, metadata=metadata,
+                expected_run_id=_worker_run_id(tid),
+            )
+        finally:
+            rconn.close()
+        if not review_ok:
+            return tool_error(
+                f"could not hand off {tid} for review (unknown id or not in "
+                f"a running/ready state)"
+            )
+        return _ok(task_id=tid, status="review")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1007,6 +1028,17 @@ KANBAN_COMPLETE_SCHEMA = {
                     "task.result). Use ``summary`` instead when "
                     "possible; this exists for compatibility with "
                     "callers that still set --result on the CLI."
+                ),
+            },
+            "review": {
+                "type": "boolean",
+                "description": (
+                    "Set true if your output is a code change that needs "
+                    "review before it counts as merged/done (most coding "
+                    "tasks). Instead of marking the task done, this hands it "
+                    "to a reviewer (moves it to the review column); the "
+                    "reviewer verifies and merges (done) or sends it back "
+                    "for fixes. Do NOT also kanban_block for review."
                 ),
             },
             "created_cards": {
