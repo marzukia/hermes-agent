@@ -134,19 +134,28 @@ def test_advance_clears_failure_counter(stage_chain_home):
 # 3. complete_task on the final stage / no chain -> done
 # ---------------------------------------------------------------------------
 
-def test_complete_final_stage_marks_done(stage_chain_home):
-    """Completing on the LAST stage marks the task done, not advanced."""
+def test_complete_final_stage_holds_for_merge(stage_chain_home):
+    """Completing on the LAST stage no longer marks the task done: it HOLDS
+    the card for the main agent's merge decision (merge gate). The card lands
+    in status='blocked' with current_step_key kept at the terminal stage, and
+    merge_task is what finally closes it to done."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="merge it", assignee="worker")
         # Walk to the final stage.
         kb.complete_task(conn, t, summary="built")     # build -> review
         kb.complete_task(conn, t, summary="reviewed")  # review -> merge
         assert kb.get_task(conn, t).current_step_key == "merge"
-        ok = kb.complete_task(conn, t, result="merged")  # merge -> done
+        ok = kb.complete_task(conn, t, result="tests pass")  # merge -> HELD
+        held = kb.get_task(conn, t)
+        assert held is not None
+        assert ok is True
+        assert held.status == "blocked"
+        assert held.current_step_key == "merge"
+        # The main agent merges -> the gate releases to done.
+        assert kb.merge_task(conn, t, result="merged") is True
         task = kb.get_task(conn, t)
-        assert task is not None
-    assert ok is True
     assert task.status == "done"
+    assert task.current_step_key is None
 
 
 def test_complete_no_chain_marks_done(kanban_home):
@@ -295,27 +304,37 @@ def test_stage_advanced_event_links_run(stage_chain_home):
 # 7. FIX D — terminal/vanished-chain done still emits an audit event
 # ---------------------------------------------------------------------------
 
-def test_terminal_stage_emits_terminal_event(stage_chain_home):
-    """Completing the final stage goes to done AND emits stage_chain_terminal
-    with chain_present=True (legit final stage)."""
+def test_terminal_stage_holds_and_emits_merge_review(stage_chain_home):
+    """Completing the LEGIT final stage (chain_present=True) now HOLDS the card
+    for the merge gate and emits merge_review_ready (carrying from_step), NOT a
+    done transition. The stage_chain_terminal audit event is reserved for the
+    misconfig/vanished-chain done path (covered separately) so a held card does
+    not emit it."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="merge it", assignee="worker")
         kb.complete_task(conn, t, summary="built")     # build -> review
         kb.complete_task(conn, t, summary="reviewed")  # review -> merge
-        ok = kb.complete_task(conn, t, result="merged")  # merge -> done
+        ok = kb.complete_task(conn, t, result="tests pass")  # merge -> HELD
         task = kb.get_task(conn, t)
-        ev = conn.execute(
+        mr = conn.execute(
             "SELECT payload FROM task_events "
-            "WHERE task_id = ? AND kind = 'stage_chain_terminal' "
+            "WHERE task_id = ? AND kind = 'merge_review_ready' "
             "ORDER BY id DESC LIMIT 1",
             (t,),
         ).fetchone()
+        term = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND kind = 'stage_chain_terminal'",
+            (t,),
+        ).fetchone()
     assert ok is True
-    assert task is not None and task.status == "done"
-    assert ev is not None
-    payload = json.loads(ev["payload"])
+    assert task is not None and task.status == "blocked"
+    assert task.current_step_key == "merge"
+    assert mr is not None
+    payload = json.loads(mr["payload"])
     assert payload["from_step"] == "merge"
-    assert payload["chain_present"] is True
+    # Legit terminal hold does NOT take the misconfig audit path.
+    assert term is None
 
 
 def test_vanished_chain_done_emits_terminal_event(stage_chain_home):

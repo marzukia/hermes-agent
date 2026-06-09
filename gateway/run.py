@@ -5277,7 +5277,18 @@ class GatewayRunner:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+        TERMINAL_KINDS = (
+            "completed", "blocked", "gave_up", "crashed", "timed_out",
+            # Fired by complete_task when a stage_chain task finishes its
+            # final stage: the PR passed review+test and is ready for a
+            # human-style merge review. Delivered to the subscribed chat
+            # (the operator's main session) as a normal tail message.
+            "merge_review_ready",
+            # Fired by block_task when a worker blocks with a genuine
+            # human-input reason (credentials missing, UX choice, etc.).
+            # Delivered to the configured target so the operator can act.
+            "needs_human_input",
+        )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -5303,6 +5314,67 @@ class GatewayRunner:
         if not notifier_profile:
             notifier_profile = self._active_profile_name()
             self._kanban_notifier_profile = notifier_profile
+
+        # MERGE GATE: guaranteed notify target for merge_review_ready pings.
+        # Chain tasks are created by foreman/worker, so the operator's main
+        # 122B session is NOT auto-subscribed and would otherwise get
+        # nothing when a terminal-stage PR is held for review. config.yaml
+        # ``kanban.merge_review_notify`` names that main session
+        # (platform + chat_id [+ thread_id]); we deliver the merge ping
+        # there for every held PR regardless of who created the task.
+        # Backward-safe: if the config is absent, this stays None and the
+        # existing per-task auto-subscribe behaviour is the only path.
+        merge_notify_target: Optional[dict] = None
+        try:
+            _mn = kanban_cfg.get("merge_review_notify") if isinstance(kanban_cfg, dict) else None
+            if isinstance(_mn, dict):
+                _mn_platform = str(_mn.get("platform") or "").lower().strip()
+                _mn_chat = str(_mn.get("chat_id") or "").strip()
+                _mn_thread = str(_mn.get("thread_id") or "").strip()
+                if _mn_platform and _mn_chat:
+                    merge_notify_target = {
+                        "platform": _mn_platform,
+                        "chat_id": _mn_chat,
+                        "thread_id": _mn_thread,
+                    }
+                else:
+                    logger.warning(
+                        "kanban notifier: kanban.merge_review_notify set but "
+                        "missing platform/chat_id; ignoring"
+                    )
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: bad kanban.merge_review_notify config (%s); "
+                "falling back to auto-subscribe only", exc
+            )
+            merge_notify_target = None
+
+        # needs_human_input: guaranteed notify target, same pattern as merge.
+        # Config: kanban.needs_human_input_notify {platform, chat_id, thread_id}
+        needs_human_input_target: Optional[dict] = None
+        try:
+            _nhi = kanban_cfg.get("needs_human_input_notify") if isinstance(kanban_cfg, dict) else None
+            if isinstance(_nhi, dict):
+                _nhi_platform = str(_nhi.get("platform") or "").lower().strip()
+                _nhi_chat = str(_nhi.get("chat_id") or "").strip()
+                _nhi_thread = str(_nhi.get("thread_id") or "").strip()
+                if _nhi_platform and _nhi_chat:
+                    needs_human_input_target = {
+                        "platform": _nhi_platform,
+                        "chat_id": _nhi_chat,
+                        "thread_id": _nhi_thread,
+                    }
+                else:
+                    logger.warning(
+                        "kanban notifier: kanban.needs_human_input_notify set but "
+                        "missing platform/chat_id; ignoring"
+                    )
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: bad kanban.needs_human_input_notify config (%s); "
+                "falling back to auto-subscribe only", exc
+            )
+            needs_human_input_target = None
 
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
@@ -5402,6 +5474,110 @@ class GatewayRunner:
                                     "task": task,
                                     "board": slug,
                                 })
+                            # MERGE GATE: deliver merge_review_ready pings to
+                            # the configured main session for EVERY held PR
+                            # on this board, independent of per-task subs.
+                            if merge_notify_target is not None:
+                                mt_platform = merge_notify_target["platform"]
+                                if mt_platform in active_platforms:
+                                    try:
+                                        _kb.ensure_merge_review_sub(
+                                            conn,
+                                            platform=mt_platform,
+                                            chat_id=merge_notify_target["chat_id"],
+                                            thread_id=merge_notify_target["thread_id"] or None,
+                                            notifier_profile=notifier_profile,
+                                        )
+                                        mt_old, mt_cursor, mt_events = (
+                                            _kb.claim_unseen_merge_reviews(
+                                                conn,
+                                                platform=mt_platform,
+                                                chat_id=merge_notify_target["chat_id"],
+                                                thread_id=merge_notify_target["thread_id"] or None,
+                                            )
+                                        )
+                                    except Exception as exc:
+                                        logger.debug(
+                                            "kanban notifier: merge-target claim "
+                                            "failed on board %s: %s", slug, exc,
+                                        )
+                                        mt_events = []
+                                        mt_old = mt_cursor = 0
+                                    if mt_events:
+                                        # Build a sub-shaped dict so the
+                                        # delivery loop + cursor helpers reuse
+                                        # the same code path.
+                                        mt_sub = {
+                                            "task_id": _kb.MERGE_REVIEW_SENTINEL_TASK,
+                                            "platform": mt_platform,
+                                            "chat_id": merge_notify_target["chat_id"],
+                                            "thread_id": merge_notify_target["thread_id"] or "",
+                                        }
+                                        deliveries.append({
+                                            "sub": mt_sub,
+                                            "old_cursor": mt_old,
+                                            "cursor": mt_cursor,
+                                            "events": mt_events,
+                                            "task": None,
+                                            "board": slug,
+                                            "merge_target": True,
+                                        })
+                                else:
+                                    logger.debug(
+                                        "kanban notifier: merge-target platform %s "
+                                        "adapter not connected; skipping board %s",
+                                        mt_platform, slug,
+                                    )
+                            # needs_human_input: deliver pings to the
+                            # configured target, same pattern as merge gate.
+                            if needs_human_input_target is not None:
+                                nhi_platform = needs_human_input_target["platform"]
+                                if nhi_platform in active_platforms:
+                                    try:
+                                        _kb.ensure_needs_human_input_sub(
+                                            conn,
+                                            platform=nhi_platform,
+                                            chat_id=needs_human_input_target["chat_id"],
+                                            thread_id=needs_human_input_target["thread_id"] or None,
+                                            notifier_profile=notifier_profile,
+                                        )
+                                        nhi_old, nhi_cursor, nhi_events = (
+                                            _kb.claim_unseen_needs_human_input(
+                                                conn,
+                                                platform=nhi_platform,
+                                                chat_id=needs_human_input_target["chat_id"],
+                                                thread_id=needs_human_input_target["thread_id"] or None,
+                                            )
+                                        )
+                                    except Exception as exc:
+                                        logger.debug(
+                                            "kanban notifier: needs_human_input claim "
+                                            "failed on board %s: %s", slug, exc,
+                                        )
+                                        nhi_events = []
+                                        nhi_old = nhi_cursor = 0
+                                    if nhi_events:
+                                        nhi_sub = {
+                                            "task_id": _kb.NEEDS_HUMAN_INPUT_SENTINEL_TASK,
+                                            "platform": nhi_platform,
+                                            "chat_id": needs_human_input_target["chat_id"],
+                                            "thread_id": needs_human_input_target["thread_id"] or "",
+                                        }
+                                        deliveries.append({
+                                            "sub": nhi_sub,
+                                            "old_cursor": nhi_old,
+                                            "cursor": nhi_cursor,
+                                            "events": nhi_events,
+                                            "task": None,
+                                            "board": slug,
+                                            "needs_human_input_target": True,
+                                        })
+                                else:
+                                    logger.debug(
+                                        "kanban notifier: needs_human_input platform %s "
+                                        "adapter not connected; skipping board %s",
+                                        nhi_platform, slug,
+                                    )
                         finally:
                             conn.close()
                     return deliveries
@@ -5491,6 +5667,71 @@ class GatewayRunner:
                                 f"⏱ {tag}Kanban {sub['task_id']} timed out "
                                 f"(max_runtime={limit}s); will retry"
                             )
+                        elif kind == "merge_review_ready":
+                            # Terminal stage of a stage_chain task: the PR
+                            # passed review+test and the card is HELD for a
+                            # merge decision. Render the PR ref (number
+                            # preferred, URL fallback), task id+title, a
+                            # pointer to the evidence (the review/test
+                            # comments on the card), and the explicit
+                            # instruction to merge or reject. For the
+                            # always-on merge-target the events span many
+                            # tasks, so the task id comes off the event row,
+                            # not the (sentinel) sub.
+                            pl = ev.payload or {}
+                            pr_number = pl.get("pr_number")
+                            pr_url = pl.get("pr_url")
+                            mr_task_id = (
+                                ev.task_id if d.get("merge_target")
+                                else sub["task_id"]
+                            )
+                            ev_title = pl.get("title") or (
+                                title if not d.get("merge_target") else mr_task_id
+                            )
+                            if pr_number is not None:
+                                pr_ref = f"PR #{pr_number}"
+                            elif pr_url:
+                                pr_ref = f"PR {pr_url}"
+                            else:
+                                pr_ref = f"Kanban {mr_task_id}"
+                            url_tail = (
+                                f"\n{pr_url}"
+                                if pr_url and pr_number is not None else ""
+                            )
+                            decide_n = (
+                                f"#{pr_number}" if pr_number is not None
+                                else mr_task_id
+                            )
+                            msg = (
+                                f"🟢 {tag}{pr_ref} ({ev_title}) passed "
+                                f"review+test and is HELD for your merge "
+                                f"decision (task {mr_task_id}). Evidence: see "
+                                f"the review/test comments on the card "
+                                f"(`hermes kanban show {mr_task_id}`). "
+                                f"Review PR {decide_n} and decide: merge or "
+                                f"reject."
+                                f"{url_tail}"
+                            )
+                        elif kind == "needs_human_input":
+                            # Worker blocked because it genuinely needs
+                            # human input (credentials, UX choice, etc.).
+                            # Render task id, title, and the reason.
+                            pl = ev.payload or {}
+                            nhi_task_id = (
+                                ev.task_id if d.get("needs_human_input_target")
+                                else sub["task_id"]
+                            )
+                            nhi_title = pl.get("title") or (
+                                title if not d.get("needs_human_input_target")
+                                else nhi_task_id
+                            )
+                            nhi_reason = str(pl.get("reason") or "unknown")[:300]
+                            msg = (
+                                f"🛑 {tag}Kanban {nhi_task_id} ({nhi_title}) "
+                                f"blocked — needs human input.\n"
+                                f"Reason: {nhi_reason}\n"
+                                f"Check: `hermes kanban show {nhi_task_id}`"
+                            )
                         else:
                             continue
                         metadata: dict[str, Any] = {}
@@ -5508,6 +5749,84 @@ class GatewayRunner:
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
                             )
+                            # MERGE-WAKE: a posted ping is invisible to
+                            # the agent's own loop, so for the merge gate
+                            # also inject a synthetic inbound turn that
+                            # wakes the main agent to RESOLVE the gate
+                            # (S10: check `gh pr checks`, then
+                            # `hermes kanban merge` / reject). internal=True
+                            # bypasses user-auth; a dedicated merge-gate
+                            # user_id keeps it in its own session lane so
+                            # human chats' cached prefixes stay pristine.
+                            # Best-effort: a failure here must never flip
+                            # the (succeeded) send to a retry, which would
+                            # re-deliver the ping forever.
+                            if d.get("merge_target") and kind == "merge_review_ready":
+                                try:
+                                    from gateway.platforms.base import (
+                                        MessageEvent as _MergeWakeEvent,
+                                    )
+                                    wake_source = adapter.build_source(
+                                        chat_id=sub["chat_id"],
+                                        chat_type=(
+                                            "thread"
+                                            if sub.get("thread_id") else "group"
+                                        ),
+                                        user_id="system:merge-gate",
+                                        user_name="MergeGate",
+                                        thread_id=sub.get("thread_id") or None,
+                                    )
+                                    await adapter.handle_message(
+                                        _MergeWakeEvent(
+                                            text=msg,
+                                            source=wake_source,
+                                            internal=True,
+                                        )
+                                    )
+                                    logger.info(
+                                        "kanban notifier: merge-wake injected for %s on %s/%s",
+                                        mr_task_id, platform_str, sub["chat_id"],
+                                    )
+                                except Exception as wake_exc:
+                                    logger.warning(
+                                        "kanban notifier: merge-wake inject failed for %s: %s",
+                                        sub["task_id"], wake_exc,
+                                    )
+                            # needs_human_input wake: inject a synthetic
+                            # inbound turn so the main agent sees the block
+                            # reason and can act on it (unblock, provide
+                            # context, etc.).
+                            if d.get("needs_human_input_target") and kind == "needs_human_input":
+                                try:
+                                    from gateway.platforms.base import (
+                                        MessageEvent as _NhiWakeEvent,
+                                    )
+                                    wake_source = adapter.build_source(
+                                        chat_id=sub["chat_id"],
+                                        chat_type=(
+                                            "thread"
+                                            if sub.get("thread_id") else "group"
+                                        ),
+                                        user_id="system:needs-human-input",
+                                        user_name="NeedsHumanInput",
+                                        thread_id=sub.get("thread_id") or None,
+                                    )
+                                    await adapter.handle_message(
+                                        _NhiWakeEvent(
+                                            text=msg,
+                                            source=wake_source,
+                                            internal=True,
+                                        )
+                                    )
+                                    logger.info(
+                                        "kanban notifier: needs_human_input-wake injected for %s on %s/%s",
+                                        nhi_task_id, platform_str, sub["chat_id"],
+                                    )
+                                except Exception as wake_exc:
+                                    logger.warning(
+                                        "kanban notifier: needs_human_input-wake inject failed for %s: %s",
+                                        sub["task_id"], wake_exc,
+                                    )
                             # After delivering the text notification, surface
                             # any artifact paths the worker referenced in
                             # ``kanban_complete(summary=..., artifacts=[...])``

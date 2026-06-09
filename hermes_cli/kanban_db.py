@@ -8,7 +8,6 @@ the cross-profile coordination primitive. A worker spawned with
 claimed the task. The same applies to ``<root>/kanban/workspaces/`` and
 ``<root>/kanban/logs/``.
 
-**Multiple boards (projects):** users can create additional boards to
 separate unrelated streams of work (e.g. one per project / repo / domain).
 Each board is a directory under ``<root>/kanban/boards/<slug>/`` with
 its own ``kanban.db``, ``workspaces/``, and ``logs/``. All boards share
@@ -791,7 +790,7 @@ class Task:
     # judge agrees, the goal-turn budget is exhausted (→ kanban_block),
     # or the worker explicitly blocks/completes. ``False`` (default) =
     # the classic single-shot worker. ``goal_max_turns`` bounds the loop.
-    goal_mode: bool = False
+    goal_mode: bool = True
     # Goal-loop turn budget for ``goal_mode`` workers. ``None`` falls
     # through to the goals engine default (``goals.DEFAULT_MAX_TURNS``).
     goal_max_turns: Optional[int] = None
@@ -2067,7 +2066,7 @@ def create_task(
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
-    goal_mode: bool = False,
+    goal_mode: bool = True,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
@@ -2882,11 +2881,11 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked', 'merge_review_ready') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return bool(row) and row["kind"] in ("blocked", "merge_review_ready")
 
 
 def recompute_ready(
@@ -3639,6 +3638,26 @@ def _resolve_stage_chain(conn=None) -> list:
                     return cleaned
         except Exception:
             pass
+        # 1b. Durable fallback: kanban.stage_chains[<board>] in the root
+        #     config.yaml. board.json is deleted by the foreman on board
+        #     resets, so the chain also lives in config.yaml where nothing
+        #     wipes it. Config path is derived from the connection's own DB
+        #     dir, so this is env-independent like the board.json read above.
+        try:
+            import yaml as _yaml
+            slug = os.path.basename(d)
+            root = os.path.dirname(os.path.dirname(os.path.dirname(d)))
+            cfgp = os.path.join(root, "config.yaml")
+            if os.path.isfile(cfgp):
+                with open(cfgp, encoding="utf-8") as fh:
+                    cfgd = _yaml.safe_load(fh) or {}
+                kc = cfgd.get("kanban") if isinstance(cfgd, dict) else {}
+                chains = (kc or {}).get("stage_chains") or {}
+                cleaned = _clean_stage_chain(chains.get(slug) if isinstance(chains, dict) else None)
+                if cleaned:
+                    return cleaned
+        except Exception:
+            pass
     # 2. Fallback: ambient resolution (covers any conn-less caller).
     try:
         board = os.environ.get("HERMES_KANBAN_BOARD")
@@ -3837,6 +3856,107 @@ def complete_task(
         recompute_ready(conn)
         return True
 
+    # MERGE GATE: a chain task that reached its real terminal stage (it
+    # carried a current_step_key but has no successor stage, and the chain
+    # is actually configured) is a PR that passed review+test. Instead of
+    # marking it done, HOLD it in a pending-merge state so the main agent
+    # (the merge authority) can review PR + evidence and decide. The card
+    # stays held (status='blocked', reason "awaiting merge decision",
+    # current_step_key preserved at the terminal key) until the agent
+    # acts via merge_task / reject_merge. The merge_review_ready event
+    # still fires so the configured target gets pinged.
+    #
+    # Safe-by-default & backward-compatible:
+    #   * only triggers when a stage_chain is actually present AND the
+    #     task carried a current_step_key (non-chain tasks never do, and
+    #     non-terminal completions took the advance path above);
+    #   * if the chain vanished (board.json/config gone) chain_present is
+    #     False and we fall through to the normal done path below, exactly
+    #     as before — no card gets stuck held on a misconfig;
+    #   * never raises during the ping; a notify failure cannot break the
+    #     hold.
+    _hold_chain_present = False
+    if _cur_step_key:
+        try:
+            _hold_chain_present = bool(_resolve_stage_chain(conn))
+        except Exception:
+            _hold_chain_present = False
+    if _cur_step_key and _hold_chain_present:
+        with write_txn(conn):
+            if expected_run_id is None:
+                cur = conn.execute(
+                    "UPDATE tasks SET status='blocked', claim_lock=NULL, "
+                    "claim_expires=NULL, worker_pid=NULL "
+                    "WHERE id=? AND status IN ('running','ready','blocked')",
+                    (task_id,),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE tasks SET status='blocked', claim_lock=NULL, "
+                    "claim_expires=NULL, worker_pid=NULL "
+                    "WHERE id=? AND status IN ('running','ready','blocked') "
+                    "AND current_run_id=?",
+                    (task_id, int(expected_run_id)),
+                )
+            if cur.rowcount != 1:
+                return False
+            # Close the terminal-stage run so attempt history + handoff
+            # summary are preserved (mirrors the advance/done paths).
+            _hold_run_id = _end_run(
+                conn, task_id, outcome="merge_review_ready", status="blocked",
+                summary=summary if summary is not None else result,
+                metadata=metadata,
+            )
+            if _hold_run_id is None and (summary or metadata or result):
+                _hold_run_id = _synthesize_ended_run(
+                    conn, task_id,
+                    outcome="merge_review_ready",
+                    summary=summary if summary is not None else result,
+                    metadata=metadata,
+                )
+            # Visible block reason on the card/dashboard. (The live
+            # block_task edit adds a similar comment for normal blocks;
+            # we hold inline rather than via block_task so the comment is
+            # added here regardless of which kanban_db revision is
+            # deployed.)
+            try:
+                conn.execute(
+                    "INSERT INTO task_comments "
+                    "(task_id, author, body, created_at) VALUES (?, ?, ?, ?)",
+                    (task_id, "system", _MERGE_HELD_COMMENT, int(time.time())),
+                )
+            except Exception:
+                pass
+            # Emit the merge_review_ready ping (BEFORE no completed event
+            # — this card is NOT done). Carries PR ref + title; degrades
+            # gracefully when no PR ref is found. Never raises.
+            try:
+                _title_row = conn.execute(
+                    "SELECT title FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+                _mr_title = (
+                    _title_row["title"] if _title_row is not None
+                    and "title" in _title_row.keys() else None
+                )
+                _pr_url, _pr_number = _extract_pr_ref(conn, task_id)
+                _mr_payload: dict = {"from_step": _cur_step_key}
+                if _mr_title:
+                    _mr_payload["title"] = str(_mr_title)[:200]
+                if _pr_url:
+                    _mr_payload["pr_url"] = _pr_url
+                if _pr_number is not None:
+                    _mr_payload["pr_number"] = _pr_number
+                _append_event(
+                    conn, task_id, "merge_review_ready", _mr_payload,
+                    run_id=_hold_run_id,
+                )
+            except Exception:
+                pass
+        # The card is held, not finished; do NOT clear the workspace (the
+        # worker's branch/scratch may still be needed for a reject-rerun)
+        # and do NOT recompute_ready for dependents (the gate isn't done).
+        return True
+
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -3878,14 +3998,27 @@ def complete_task(
         # (chain_present=False). Emit one cheap, never-raising audit event so a
         # misconfig-induced early-done is not silent. Never blocks completion.
         if _cur_step_key:
+            _chain_present = False
+            try:
+                _chain_present = bool(_resolve_stage_chain(conn))
+            except Exception:
+                _chain_present = False
             try:
                 _append_event(
                     conn, task_id, "stage_chain_terminal",
                     {"from_step": _cur_step_key,
-                     "chain_present": bool(_resolve_stage_chain(conn))},
+                     "chain_present": _chain_present},
                 )
             except Exception:
                 pass
+            # NOTE: the terminal-stage merge_review_ready ping is emitted by
+            # the MERGE GATE hold branch ABOVE (which intercepts a terminal
+            # chain completion before this done path). Reaching this done
+            # path with a current_step_key means the chain vanished
+            # (chain_present is False) — a misconfig, not a real terminal
+            # stage — so we only record the stage_chain_terminal audit event
+            # and let completion fall through to done as before. The merge
+            # gate never relies on this path.
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
@@ -4278,6 +4411,20 @@ def block_task(
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running -> blocked``."""
+    # Stage-chain guard: when a stage chain is configured and the task has
+    # a next stage, reject kanban_block("review-required: …") — the worker
+    # should call kanban_complete() instead so the chain advances.  This
+    # prevents workers from bypassing the stage chain and leaving tasks
+    # stuck in blocked.
+    _REVIEW_RE = re.compile(r"review.?required|needs.?review", re.IGNORECASE)
+    if reason and _REVIEW_RE.search(str(reason)):
+        nxt = _next_stage_for(conn, task_id)
+        if nxt is not None:
+            raise RuntimeError(
+                f"Cannot block {task_id} with 'review-required' when a stage "
+                f"chain is configured — use kanban_complete() instead so the "
+                f"task advances to the next stage ({nxt.get('key')})."
+            )
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -4322,6 +4469,39 @@ def block_task(
                 summary=reason,
             )
         _append_event(conn, task_id, "blocked", {"reason": reason}, run_id=run_id)
+        # Surface the block reason in the visible comment thread, not just
+        # the event log, so it shows on the card/dashboard.
+        if reason:
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (task_id, "system", "Blocked: " + str(reason), int(time.time())),
+            )
+        # needs_human_input: emit a cross-task event so the configured
+        # notify target (Franky) gets pinged immediately when a worker
+        # blocks because it genuinely needs human input.  Mirrors the
+        # merge_review_ready pattern — sentinel subscription, cursor-based
+        # claim, gateway rendering.
+        # Only fires for genuine human-input blocks, NOT for review-required
+        # (which the stage chain handles) or stage-chain holds.
+        if reason and not _REVIEW_RE.search(str(reason)):
+            try:
+                _title_row = conn.execute(
+                    "SELECT title FROM tasks WHERE id = ?", (task_id,)
+                ).fetchone()
+                _nhi_title = (
+                    _title_row["title"] if _title_row is not None
+                    and "title" in _title_row.keys() else None
+                )
+                _nhi_payload: dict = {"reason": str(reason)[:500]}
+                if _nhi_title:
+                    _nhi_payload["title"] = str(_nhi_title)[:200]
+                _append_event(
+                    conn, task_id, "needs_human_input", _nhi_payload,
+                    run_id=run_id,
+                )
+            except Exception:
+                pass
         return True
 
 
@@ -5019,6 +5199,240 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
     re.IGNORECASE,
 )
+
+# Block reason / comment used when a terminal-stage chain task is HELD for
+# the main agent's merge decision (see the MERGE GATE branch in
+# complete_task). The card sits in status='blocked' with current_step_key
+# preserved at the terminal stage; merge_task / reject_merge are the only
+# clean ways out.
+_MERGE_HELD_REASON = "awaiting merge decision"
+_MERGE_HELD_COMMENT = "HELD: awaiting merge decision (main agent: merge or reject)"
+
+
+def _is_terminal_step(conn, cur_key: Optional[str]) -> bool:
+    """True iff ``cur_key`` is the LAST stage of the configured chain.
+
+    Used to recognise a merge-held card: status='blocked' +
+    current_step_key set to the terminal stage uniquely identifies the
+    merge gate (a normally-blocked mid-chain card carries a non-terminal
+    current_step_key, and non-chain cards carry none). Never raises.
+    """
+    if not cur_key:
+        return False
+    try:
+        chain = _resolve_stage_chain(conn)
+    except Exception:
+        return False
+    if not chain:
+        return False
+    keys = [s["key"] for s in chain]
+    return bool(keys) and keys[-1] == cur_key
+
+
+def _extract_pr_ref(
+    conn: sqlite3.Connection, task_id: str
+) -> tuple[Optional[str], Optional[int]]:
+    """Best-effort: find the GitHub PR a chain worker opened for ``task_id``.
+
+    Workers comment the PR URL on the task when they open it (the same
+    convention the respawn guard already keys off — see
+    :data:`_RESPAWN_GUARD_PR_URL_RE`). We scan task comments newest-first and
+    return ``(pr_url, pr_number)`` for the most recent match. When no PR URL is
+    present we fall back to the task's ``branch_name`` as a weak reference
+    (``(branch_name, None)``). When neither exists, ``(None, None)``.
+
+    Never raises — the caller (terminal-stage notification) must degrade
+    gracefully rather than break ``complete_task``.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ? "
+            "ORDER BY created_at DESC, id DESC",
+            (task_id,),
+        ).fetchall()
+        for r in rows:
+            body = r["body"] if "body" in r.keys() else None
+            if not body:
+                continue
+            m = _RESPAWN_GUARD_PR_URL_RE.search(body)
+            if m:
+                url = m.group(0)
+                num = None
+                nm = re.search(r"/pull/(\d+)", url)
+                if nm:
+                    try:
+                        num = int(nm.group(1))
+                    except (TypeError, ValueError):
+                        num = None
+                return url, num
+        # No PR URL anywhere — fall back to the branch name if the task has one.
+        brow = conn.execute(
+            "SELECT branch_name FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if brow is not None:
+            bn = brow["branch_name"] if "branch_name" in brow.keys() else None
+            if bn:
+                return str(bn), None
+    except Exception:
+        # Best-effort only; never let PR discovery break completion.
+        return None, None
+    return None, None
+
+
+def merge_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor: str = "main",
+    result: Optional[str] = None,
+) -> bool:
+    """Resolve a merge-held card by MERGING: transition held -> done.
+
+    This is the main agent's MERGE action after it has reviewed the PR and
+    (out of band, via ``gh pr merge``) merged it. The card must be in the
+    merge-held state (status='blocked' with current_step_key at the chain's
+    terminal stage). We clear current_step_key and mark the card done, so a
+    subsequent completion path can never re-fire ``merge_review_ready``.
+
+    Returns True on success, False if the card is not in the held state
+    (e.g. already done, or blocked for a non-merge reason). Idempotent-ish:
+    a card already ``done`` returns False (nothing to do).
+    """
+    row = conn.execute(
+        "SELECT status, current_step_key FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    status = row["status"]
+    cur_key = row["current_step_key"]
+    if status != "blocked" or not _is_terminal_step(conn, cur_key):
+        return False
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status           = 'done',
+                   result           = COALESCE(?, result),
+                   completed_at     = ?,
+                   current_step_key = NULL,
+                   claim_lock       = NULL,
+                   claim_expires    = NULL,
+                   worker_pid       = NULL
+             WHERE id = ? AND status = 'blocked'
+            """,
+            (result, now, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _synthesize_ended_run(
+            conn, task_id, outcome="merged",
+            summary=result or "merged by main agent",
+        )
+        try:
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (task_id, actor or "main",
+                 "MERGED: " + (result or "PR merged; card closed."),
+                 now),
+            )
+        except Exception:
+            pass
+        _append_event(
+            conn, task_id, "merge_decided",
+            {"decision": "merge", "actor": actor, "result": result},
+            run_id=run_id,
+        )
+        # Also emit the standard completed event so downstream consumers
+        # (dashboard / dependents) see a normal terminal close.
+        _append_event(
+            conn, task_id, "completed",
+            {"result_len": len(result) if result else 0,
+             "summary": (result or "merged")[:400], "via": "merge"},
+            run_id=run_id,
+        )
+    _clear_failure_counter(conn, task_id)
+    recompute_ready(conn)
+    _cleanup_workspace(conn, task_id)
+    return True
+
+
+def reject_merge(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    actor: str = "main",
+) -> bool:
+    """Resolve a merge-held card by REJECTING: send it back to the worker.
+
+    The main agent's REJECT action: the PR is not good enough to merge, so
+    the card goes back to the first/build stage for rework (default reject
+    behaviour — NOT killing the card). We reopen it to status='ready',
+    assignee = the first stage's profile, current_step_key = first stage
+    key, and append the agent's reject reason as a comment so the worker
+    sees why.
+
+    The card must be in the merge-held state (status='blocked' at the
+    terminal stage). Returns True on success, False otherwise. A reason is
+    required so the worker always knows what to fix.
+    """
+    if not reason or not str(reason).strip():
+        raise ValueError("reject reason is required")
+    reason = str(reason).strip()
+    row = conn.execute(
+        "SELECT status, current_step_key, assignee FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    if row["status"] != "blocked" or not _is_terminal_step(
+        conn, row["current_step_key"]
+    ):
+        return False
+    chain = _resolve_stage_chain(conn)
+    if not chain:
+        return False
+    first = chain[0]
+    first_key = first.get("key")
+    first_profile = first.get("profile")
+    now = int(time.time())
+    with write_txn(conn):
+        # Record the reject reason as a visible comment first.
+        try:
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (task_id, actor or "main", "REJECTED (back to worker): " + reason,
+                 now),
+            )
+        except Exception:
+            pass
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status           = 'ready',
+                   current_step_key = ?,
+                   assignee         = ?,
+                   result           = NULL,
+                   completed_at     = NULL,
+                   claim_lock       = NULL,
+                   claim_expires    = NULL,
+                   worker_pid       = NULL
+             WHERE id = ? AND status = 'blocked'
+            """,
+            (first_key, first_profile, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn, task_id, "merge_decided",
+            {"decision": "reject", "actor": actor, "reason": reason,
+             "to_step": first_key, "to_profile": first_profile},
+        )
+    recompute_ready(conn)
+    return True
 
 
 @dataclass
@@ -6115,13 +6529,35 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+    #    Stage-aware: the active_pr guard exists to stop the PR-CREATING
+    #    (first / build) stage opening a duplicate PR. A post-build stage
+    #    (e.g. review / test) inherits the build stage's handoff comment,
+    #    which carries that same PR URL, so applying the guard there would
+    #    wrongly park the same task's later stages for the whole PR window.
+    #    Only run the check when the task is at the build stage, or when we
+    #    can't tell the stage (no chain / no current_step_key / key absent
+    #    from the chain) — in which case we keep the original behavior so a
+    #    genuine PR-opener is still guarded.
+    _chain = _resolve_stage_chain(conn)
+    _build_key = _chain[0]["key"] if _chain else None
+    _step_row = conn.execute(
+        "SELECT current_step_key FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    _cur_step = _step_row["current_step_key"] if _step_row else None
+    _chain_keys = [s["key"] for s in _chain]
+    _is_post_build = (
+        _build_key is not None
+        and _cur_step in _chain_keys
+        and _cur_step != _build_key
+    )
+    if not _is_post_build:
+        pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+        for c in conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+            (task_id, pr_cutoff),
+        ).fetchall():
+            if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+                return "active_pr"
 
     return None
 
@@ -7437,6 +7873,17 @@ def add_notify_sub(
             )
 
 
+# Sentinel "task id" for the always-on merge-review notify target. A single
+# row per (platform, chat_id, thread_id) holds a board-wide cursor over
+# ``merge_review_ready`` events across EVERY task, so the configured main
+# session is pinged for a held PR regardless of who created the task (chain
+# tasks are created by foreman/worker and never auto-subscribe the main
+# chat). It is NOT a real task; the gateway notifier's normal per-task loop
+# skips it (see ``list_notify_subs`` filtering) and uses
+# :func:`claim_unseen_merge_reviews` instead.
+MERGE_REVIEW_SENTINEL_TASK = "__merge_review_target__"
+
+
 def list_notify_subs(
     conn: sqlite3.Connection, task_id: Optional[str] = None,
 ) -> list[dict]:
@@ -7445,8 +7892,214 @@ def list_notify_subs(
             "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (task_id,),
         ).fetchall()
     else:
-        rows = conn.execute("SELECT * FROM kanban_notify_subs").fetchall()
+        # Exclude the merge-review sentinel from the normal per-task
+        # notify loop; it is delivered via claim_unseen_merge_reviews.
+        rows = conn.execute(
+            "SELECT * FROM kanban_notify_subs WHERE task_id != ?",
+            (MERGE_REVIEW_SENTINEL_TASK,),
+        ).fetchall()
     return [dict(r) for r in rows]
+
+
+def ensure_merge_review_sub(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+) -> None:
+    """Idempotently register the always-on merge-review notify target.
+
+    Stores one sentinel row (task_id == :data:`MERGE_REVIEW_SENTINEL_TASK`)
+    whose ``last_event_id`` is a board-wide cursor over
+    ``merge_review_ready`` events. Backward-safe: only the gateway calls
+    this, and only when ``kanban.merge_review_notify`` is configured.
+
+    New subs start their cursor at the current max ``merge_review_ready``
+    event id so a freshly-configured target is NOT spammed with the full
+    backlog of historical merge events.
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT 1 FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (MERGE_REVIEW_SENTINEL_TASK, platform, chat_id, thread_id or ""),
+        ).fetchone()
+        if existing:
+            return
+        max_row = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM task_events "
+            "WHERE kind = 'merge_review_ready'"
+        ).fetchone()
+        start_cursor = int(max_row["m"]) if max_row else 0
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO kanban_notify_subs
+                (task_id, platform, chat_id, thread_id, user_id,
+                 notifier_profile, created_at, last_event_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (MERGE_REVIEW_SENTINEL_TASK, platform, chat_id, thread_id or "",
+             None, notifier_profile, now, start_cursor),
+        )
+
+
+def claim_unseen_merge_reviews(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> tuple[int, int, list[Event]]:
+    """Atomically claim unseen cross-task ``merge_review_ready`` events.
+
+    Mirrors :func:`claim_unseen_events_for_sub` but the sentinel row's
+    cursor spans EVERY task, so the configured main session receives the
+    merge ping for any held PR. Returns ``(old_cursor, new_cursor,
+    events)`` and advances the sentinel cursor inside the same write txn so
+    concurrent gateways don't double-deliver.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT last_event_id FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (MERGE_REVIEW_SENTINEL_TASK, platform, chat_id, thread_id or ""),
+        ).fetchone()
+        if row is None:
+            return 0, 0, []
+        old_cursor = int(row["last_event_id"])
+        rows = conn.execute(
+            "SELECT * FROM task_events WHERE kind = 'merge_review_ready' "
+            "AND id > ? ORDER BY id ASC",
+            (old_cursor,),
+        ).fetchall()
+        events: list[Event] = []
+        max_id = old_cursor
+        for r in rows:
+            try:
+                payload = json.loads(r["payload"]) if r["payload"] else None
+            except Exception:
+                payload = None
+            events.append(Event(
+                id=r["id"], task_id=r["task_id"], kind=r["kind"],
+                payload=payload, created_at=r["created_at"],
+                run_id=(int(r["run_id"]) if "run_id" in r.keys()
+                        and r["run_id"] is not None else None),
+            ))
+            max_id = max(max_id, int(r["id"]))
+        if not events:
+            return old_cursor, old_cursor, []
+        conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND last_event_id = ?",
+            (int(max_id), MERGE_REVIEW_SENTINEL_TASK, platform, chat_id,
+             thread_id or "", int(old_cursor)),
+        )
+        return old_cursor, max_id, events
+
+
+# ---------------------------------------------------------------------------
+# needs_human_input notification — mirrors merge_review_ready but for tasks
+# blocked because they genuinely need human input (not review-required, which
+# the stage chain handles).
+# ---------------------------------------------------------------------------
+
+NEEDS_HUMAN_INPUT_SENTINEL_TASK = "__needs_human_input_target__"
+
+
+def ensure_needs_human_input_sub(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+) -> None:
+    """Idempotently register the always-on needs_human_input notify target.
+
+    Mirrors :func:`ensure_merge_review_sub` but for ``needs_human_input``
+    events emitted by :func:`block_task` when a worker blocks with a genuine
+    human-input reason (credentials missing, UX choice, etc.).
+    """
+    now = int(time.time())
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT 1 FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (NEEDS_HUMAN_INPUT_SENTINEL_TASK, platform, chat_id, thread_id or ""),
+        ).fetchone()
+        if existing:
+            return
+        max_row = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) AS m FROM task_events "
+            "WHERE kind = 'needs_human_input'"
+        ).fetchone()
+        start_cursor = int(max_row["m"]) if max_row else 0
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO kanban_notify_subs
+                (task_id, platform, chat_id, thread_id, user_id,
+                 notifier_profile, created_at, last_event_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (NEEDS_HUMAN_INPUT_SENTINEL_TASK, platform, chat_id, thread_id or "",
+             None, notifier_profile, now, start_cursor),
+        )
+
+
+def claim_unseen_needs_human_input(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> tuple[int, int, list[Event]]:
+    """Atomically claim unseen cross-task ``needs_human_input`` events.
+
+    Mirrors :func:`claim_unseen_merge_reviews` but for the
+    ``needs_human_input`` event kind.
+    """
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT last_event_id FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (NEEDS_HUMAN_INPUT_SENTINEL_TASK, platform, chat_id, thread_id or ""),
+        ).fetchone()
+        if row is None:
+            return 0, 0, []
+        old_cursor = int(row["last_event_id"])
+        rows = conn.execute(
+            "SELECT * FROM task_events WHERE kind = 'needs_human_input' "
+            "AND id > ? ORDER BY id ASC",
+            (old_cursor,),
+        ).fetchall()
+        events: list[Event] = []
+        max_id = old_cursor
+        for r in rows:
+            try:
+                payload = json.loads(r["payload"]) if r["payload"] else None
+            except Exception:
+                payload = None
+            events.append(Event(
+                id=r["id"], task_id=r["task_id"], kind=r["kind"],
+                payload=payload, created_at=r["created_at"],
+                run_id=(int(r["run_id"]) if "run_id" in r.keys()
+                        and r["run_id"] is not None else None),
+            ))
+            max_id = max(max_id, int(r["id"]))
+        if not events:
+            return old_cursor, old_cursor, []
+        conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id = ? "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+            "AND last_event_id = ?",
+            (int(max_id), NEEDS_HUMAN_INPUT_SENTINEL_TASK, platform, chat_id,
+             thread_id or "", int(old_cursor)),
+        )
+        return old_cursor, max_id, events
 
 
 def remove_notify_sub(

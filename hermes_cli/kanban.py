@@ -555,6 +555,28 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_block.add_argument("--ids", nargs="+", default=None,
                          help="Additional task ids to block with the same reason (bulk mode)")
 
+    p_merge = sub.add_parser(
+        "merge",
+        help="Resolve a merge-held card by MERGING (held -> done). "
+             "Run after you've merged the PR (e.g. gh pr merge).",
+    )
+    p_merge.add_argument("task_id")
+    p_merge.add_argument(
+        "--result", default=None,
+        help="Optional note recorded as the card's result (e.g. PR #N merged).",
+    )
+
+    p_reject = sub.add_parser(
+        "reject",
+        help="Resolve a merge-held card by REJECTING: send it back to the "
+             "worker/first stage for rework (does NOT kill the card).",
+    )
+    p_reject.add_argument("task_id")
+    p_reject.add_argument(
+        "reason", nargs="+",
+        help="Why the PR was rejected (recorded as a comment for the worker).",
+    )
+
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
     p_schedule.add_argument("reason", nargs="*", help="Reason/timing note (also appended as a comment)")
@@ -939,6 +961,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "complete": _cmd_complete,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
+            "merge":    _cmd_merge,
+            "reject":   _cmd_reject,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
@@ -1945,17 +1969,67 @@ def _cmd_block(args: argparse.Namespace) -> int:
         for tid in ids:
             if reason:
                 kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
-            if not kb.block_task(
-                conn,
-                tid,
-                reason=reason,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                if not kb.block_task(
+                    conn,
+                    tid,
+                    reason=reason,
+                    expected_run_id=_worker_run_id_for(tid),
+                ):
+                    failed.append(tid)
+                    print(f"cannot block {tid}", file=sys.stderr)
+                else:
+                    print(f"Blocked {tid}" + (f": {reason}" if reason else ""))
+            except RuntimeError as e:
                 failed.append(tid)
-                print(f"cannot block {tid}", file=sys.stderr)
-            else:
-                print(f"Blocked {tid}" + (f": {reason}" if reason else ""))
+                print(f"cannot block {tid}: {e}", file=sys.stderr)
     return 0 if not failed else 1
+
+
+def _cmd_merge(args: argparse.Namespace) -> int:
+    """Merge action for the main agent: resolve a held card (held -> done).
+
+    The PR merge itself (``gh pr merge``) happens out of band; this closes
+    the held kanban card so the gate releases.
+    """
+    author = _profile_author()
+    result = getattr(args, "result", None)
+    with kb.connect_closing() as conn:
+        if not kb.merge_task(conn, args.task_id, actor=author, result=result):
+            print(
+                f"cannot merge {args.task_id}: not a merge-held card "
+                f"(must be blocked at the terminal stage awaiting a merge "
+                f"decision). Check `hermes kanban show {args.task_id}`.",
+                file=sys.stderr,
+            )
+            return 1
+    print(f"Merged {args.task_id} (card closed → done)")
+    return 0
+
+
+def _cmd_reject(args: argparse.Namespace) -> int:
+    """Reject action for the main agent: send a held card back to the worker."""
+    reason = " ".join(args.reason).strip() if args.reason else ""
+    if not reason:
+        print("a reject reason is required", file=sys.stderr)
+        return 2
+    author = _profile_author()
+    with kb.connect_closing() as conn:
+        try:
+            ok = kb.reject_merge(conn, args.task_id, reason=reason, actor=author)
+        except ValueError as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 2
+        if not ok:
+            print(
+                f"cannot reject {args.task_id}: not a merge-held card "
+                f"(must be blocked at the terminal stage awaiting a merge "
+                f"decision). Check `hermes kanban show {args.task_id}`.",
+                file=sys.stderr,
+            )
+            return 1
+    print(f"Rejected {args.task_id} → back to worker: {reason}")
+    return 0
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
@@ -2730,7 +2804,6 @@ def _cmd_gc(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 _SLASH_KANBAN_HELP = """\
-**/kanban** — manage the shared task board.
 
 Common subcommands:
   `list` (alias `ls`)   List tasks on the current board
@@ -2740,6 +2813,8 @@ Common subcommands:
   `comment <id> <msg>`  Append a comment
   `complete <id>…`      Mark task(s) done
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
+  `merge <id>`          Resolve a merge-held PR card: held → done (after you gh-merge the PR)
+  `reject <id> <why>`   Resolve a merge-held card: send it back to the worker to rework
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
   `assignees`           Known profiles + counts

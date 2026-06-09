@@ -20,7 +20,6 @@ Hermes setups vary widely. Some users run a single profile that does everything;
 
 Before fanning out, you must ground the decomposition in the profiles that actually exist. The dispatcher silently fails to spawn unknown assignee names — it doesn't autocorrect, doesn't suggest, doesn't fall back. So a card assigned to `researcher` on a setup that only has `docker-worker` just sits in `ready` forever.
 
-**Step 0: discover available profiles before planning.**
 
 Use one of these:
 
@@ -151,33 +150,20 @@ Tell them what you created in plain prose, naming the actual profiles you used:
 
 ## Common patterns
 
-**Fan-out + fan-in (research → synthesize):** N research-style cards with no parents, one synthesis card with all of them as parents.
 
-**Parallel implementation + validation:** one implementer card makes the change while one explorer/researcher card verifies config, docs, or source mapping. A reviewer card can depend on both. Do not make the implementer own unrelated verification just because the user mentioned both in one sentence.
 
-**Pipeline with gates:** `planner → implementer → reviewer`. Each stage's `parents=[previous_task]`. Reviewer blocks or completes; if reviewer blocks, the operator unblocks with feedback and respawns.
 
-**Same-profile queue:** N tasks, all assigned to the same profile, no dependencies between them. Dispatcher serializes — that profile processes them in priority order, accumulating experience in its own memory.
 
-**Human-in-the-loop:** Any task can `kanban_block()` to wait for input. Dispatcher respawns after `/unblock`. The comment thread carries the full context.
 
 ## Pitfalls
 
-**Inventing profile names that don't exist.** The dispatcher silently fails to spawn unknown assignees — the card just sits in `ready` forever. Always assign to a profile from your Step 0 discovery; ask the user if you're unsure.
 
-**Bundling independent lanes into one card.** If the user asks for two independent outcomes, create two cards. Example: "fix blockers and check model variants" is not one fixer task; create a fixer/engineer card for the fixes and an explorer/researcher card for the variant check, then optionally gate review on both.
 
-**Over-linking because of wording.** "Finally check X" may still be parallel with implementation if X is static config, docs, or source discovery. Link it after implementation only when the check depends on the implementation result.
 
-**Forgetting dependency links.** If the task graph says `research -> implement -> review`, do not create all tasks as independent ready cards. Use parent links so implement/review cannot run before their inputs exist.
 
-**Reassignment vs. new task.** If a reviewer blocks with "needs changes," create a NEW task linked from the reviewer's task — don't re-run the same task with a stern look. The new task is assigned to the original implementer profile.
 
-**Argument order for links.** `kanban_link(parent_id=..., child_id=...)` — parent first. Mixing them up demotes the wrong task to `todo`.
 
-**Don't pre-create the whole graph if the shape depends on intermediate findings.** If T3's structure depends on what T1 and T2 find, let T3 exist as a "synthesize findings" task whose own first step is to read parent handoffs and plan the rest. Orchestrators can spawn orchestrators.
 
-**Tenant inheritance.** If `HERMES_TENANT` is set in your env, pass `tenant=os.environ.get("HERMES_TENANT")` on every `kanban_create` call so child tasks stay in the same namespace.
 
 ## Goal-mode cards (persistent workers)
 
@@ -202,6 +188,30 @@ How it behaves:
 When to use it: long, multi-step, or "keep going until X is true" cards. When NOT to: cheap one-shot cards (translation of a single string, a quick lookup) — the judge overhead isn't worth it, and the dispatcher's existing retry/circuit-breaker already handles transient worker failures.
 
 Write the body as **explicit acceptance criteria** — the judge is only as good as the goal text. "Translate the README" is weaker than "Translate every section of the README to French; no English sentences remain."
+
+## The merge gate (you are the merge authority)
+
+When a board runs a `stage_chain` whose last stage is a merge stage, a card that passes every earlier stage (build, review, test) does NOT auto-close. It is **held** at the terminal stage (status `blocked`, reason "awaiting merge decision") and you get a `merge_review_ready` ping that looks like:
+
+> 🟢 PR #123 (Move FAB to bottom-right) passed review+test and is HELD for your merge decision (task t_ab12…). Evidence: see the review/test comments on the card (`hermes kanban show t_ab12…`). Review PR #123 and decide: merge or reject.
+
+That ping means: **go look at PR #N and the evidence on the card, then either merge it and close the card, or reject it back to the worker.** Do not ignore it — the card stays held until you act.
+
+How to act:
+
+- **MERGE** — when the PR is good. Merge it on GitHub, then close the held card:
+  ```
+  gh pr merge <N> --squash --delete-branch    # or your repo's merge style
+  hermes kanban merge <task_id>               # held → done
+  ```
+  `hermes kanban merge` only closes the kanban card; it does not touch GitHub, so merge the PR first.
+- **REJECT** — when the PR needs rework. This sends the card back to the worker/first stage with your reason (the default reject behaviour is rework, NOT killing the card):
+  ```
+  hermes kanban reject <task_id> "<why it was rejected — be specific>"
+  ```
+  The reason is recorded as a comment so the worker knows what to fix; the card re-enters the chain at the build stage and flows through review/test again.
+
+Both commands only work on a genuinely merge-held card (blocked at the terminal stage). If you run them on anything else they no-op with a message; `hermes kanban show <id>` tells you the current state.
 
 ## Recovering stuck workers
 

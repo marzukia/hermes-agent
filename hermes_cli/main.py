@@ -16143,7 +16143,12 @@ Examples:
 
     # Execute the command
     if hasattr(args, "func"):
-        args.func(args)
+        # Propagate the handler's return code as the process exit status.
+        # Handlers signal failure by returning nonzero (e.g. `kanban
+        # complete` returns 1 on an unknown/terminal task); without this
+        # the code was discarded and every failure exited 0, so callers
+        # (and agents) read a no-op as success.
+        sys.exit(args.func(args) or 0)
     else:
         parser.print_help()
 
