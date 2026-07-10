@@ -368,6 +368,57 @@ def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List
         )
 
 
+def _normalize_api_messages_for_prefix_cache(
+    api_messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Canonicalize whitespace and tool-call argument JSON in ``api_messages``
+    in place so the replayed prompt is byte-stable across turns.
+
+    Local inference servers (llama.cpp, vLLM, Ollama) reuse the KV cache by
+    matching the token prefix of one turn against the next. Any byte that
+    differs in the shared history breaks that match and forces a full cold
+    re-prefill of the whole context.
+
+    Tool-call arguments are re-serialized in the model's original emission
+    (insertion) order, NOT sorted. The server built its KV cache from the
+    tokens the model emitted, so replaying those same key orders keeps the
+    cached prefix valid. Sorting keys here would reorder e.g.
+    ``{offset, limit}`` to ``{limit, offset}`` and diverge from the cache at
+    that tool call, forcing a re-prefill from that point on. The repair path
+    (``_repair_tool_call_arguments``) is likewise order-preserving, so a clean
+    call and a repaired call canonicalize to the same order.
+
+    Operates on the per-request copy; the stored conversation history keeps the
+    raw argument string either way.
+    """
+    for am in api_messages:
+        if isinstance(am.get("content"), str):
+            am["content"] = am["content"].strip()
+    for am in api_messages:
+        tcs = am.get("tool_calls")
+        if not tcs:
+            continue
+        new_tcs = []
+        for tc in tcs:
+            if isinstance(tc, dict) and "function" in tc:
+                try:
+                    args_obj = json.loads(tc["function"]["arguments"])
+                    tc = {**tc, "function": {
+                        **tc["function"],
+                        "arguments": json.dumps(
+                            args_obj, separators=(",", ":"),
+                        ),
+                    }}
+                except Exception:
+                    tc["function"]["arguments"] = _repair_tool_call_arguments(
+                        tc["function"]["arguments"],
+                        tc["function"].get("name", "?"),
+                    )
+            new_tcs.append(tc)
+        am["tool_calls"] = new_tcs
+    return api_messages
+
+
 def run_conversation(
     agent,
     user_message: str,
@@ -705,38 +756,12 @@ def run_conversation(
         # UI transcript and session persistence.
         api_messages = agent._drop_thinking_only_and_merge_users(api_messages)
 
-        # Normalize message whitespace and tool-call JSON for consistent
-        # prefix matching.  Ensures bit-perfect prefixes across turns,
-        # which enables KV cache reuse on local inference servers
-        # (llama.cpp, vLLM, Ollama) and improves cache hit rates for
-        # cloud providers.  Operates on api_messages (the API copy) so
-        # the original conversation history in `messages` is untouched.
-        for am in api_messages:
-            if isinstance(am.get("content"), str):
-                am["content"] = am["content"].strip()
-        for am in api_messages:
-            tcs = am.get("tool_calls")
-            if not tcs:
-                continue
-            new_tcs = []
-            for tc in tcs:
-                if isinstance(tc, dict) and "function" in tc:
-                    try:
-                        args_obj = json.loads(tc["function"]["arguments"])
-                        tc = {**tc, "function": {
-                            **tc["function"],
-                            "arguments": json.dumps(
-                                args_obj, separators=(",", ":"),
-                                sort_keys=True,
-                            ),
-                        }}
-                    except Exception:
-                        tc["function"]["arguments"] = _repair_tool_call_arguments(
-                            tc["function"]["arguments"],
-                            tc["function"].get("name", "?"),
-                        )
-                new_tcs.append(tc)
-            am["tool_calls"] = new_tcs
+        # Normalize whitespace + tool-call argument JSON so the replayed prompt
+        # is byte-stable across turns, which is what lets local inference
+        # servers reuse the KV cache by prefix. See
+        # _normalize_api_messages_for_prefix_cache for why arguments are
+        # replayed in emission order rather than sorted.
+        _normalize_api_messages_for_prefix_cache(api_messages)
 
         # Proactively strip any surrogate characters before the API call.
         # Models served via Ollama (Kimi K2.5, GLM-5, Qwen) can return
